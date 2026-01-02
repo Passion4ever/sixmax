@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --partition=PA100q
-#SBATCH --nodelist=node02
+#SBATCH --partition=V100q
+#SBATCH --nodelist=node22
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=32G

@@ -1,8 +1,10 @@
-"""Self-play data collection for PPO training."""
+"""Self-play data collection for PPO training with vectorized inference."""
 
 from __future__ import annotations
 
 import random
+import sys
+import time
 from typing import TYPE_CHECKING
 
 import torch
@@ -21,6 +23,8 @@ class SelfPlayCollector:
 
     Runs multiple parallel games with all players controlled by the same
     policy network, collecting transitions for training.
+
+    Uses vectorized inference for efficient GPU utilization.
     """
 
     def __init__(
@@ -60,11 +64,12 @@ class SelfPlayCollector:
         # Track active hands
         self._rng = random.Random(seed)
 
-    def collect_rollout(self, n_hands: int) -> RolloutBuffer:
-        """Collect experiences from n_hands of self-play.
+    def collect_rollout(self, n_hands: int, show_progress: bool = False) -> RolloutBuffer:
+        """Collect experiences from n_hands of self-play using vectorized inference.
 
         Args:
             n_hands: Number of hands to play across all games.
+            show_progress: Whether to show progress output.
 
         Returns:
             Buffer containing collected experiences.
@@ -72,16 +77,23 @@ class SelfPlayCollector:
         self.buffer.reset()
 
         hands_completed = 0
+        steps_collected = 0
+        start_time = time.time()
+        last_progress_time = start_time
 
         # Start all games
         for game in self.games:
             game.reset_hand()
 
         while hands_completed < n_hands:
-            made_progress = False
+            # Step 1: Collect all games needing decisions
+            pending_games = []
+            pending_indices = []
+            pending_states = []
+            pending_players = []
+            pending_legal_masks = []
 
-            # Process all games that have a decision point
-            for game in self.games:
+            for idx, game in enumerate(self.games):
                 if hands_completed >= n_hands:
                     break
 
@@ -99,24 +111,47 @@ class SelfPlayCollector:
                 if not any(legal_mask):
                     continue
 
-                made_progress = True
-
-                # Build state for current player
+                # Collect state for batch processing
                 state_dict = game.get_state_for_player(current_player)
-                state_batch = self.batch_builder.build_from_dict(state_dict)
-                state_batch = {k: v.unsqueeze(0).to(self.device) for k, v in state_batch.items()}
+                pending_games.append(game)
+                pending_indices.append(idx)
+                pending_states.append(state_dict)
+                pending_players.append(current_player)
+                pending_legal_masks.append(legal_mask)
 
-                # Get legal mask tensor
-                legal_mask_tensor = torch.tensor(legal_mask, dtype=torch.bool, device=self.device)
+            # No games need decisions
+            if not pending_games:
+                break
 
-                # Get action from network
-                with torch.no_grad():
-                    action, log_prob, value = self.network.get_action(
-                        state_batch, legal_mask_tensor.unsqueeze(0), deterministic=False
-                    )
+            # Step 2: Batch inference for all pending games
+            batch_size = len(pending_games)
 
-                # Execute action first to get reward
-                action_int = action.item()
+            # Build batched state tensors
+            state_batch = self.batch_builder.build_batch_from_dicts(pending_states)
+            state_batch = {k: v.to(self.device) for k, v in state_batch.items()}
+
+            # Build batched legal mask tensor
+            legal_mask_tensor = torch.tensor(
+                pending_legal_masks, dtype=torch.bool, device=self.device
+            )
+
+            # Batch forward pass through network
+            with torch.no_grad():
+                actions, log_probs, values = self.network.get_action(
+                    state_batch, legal_mask_tensor, deterministic=False
+                )
+
+            # Step 3: Execute actions and store experiences
+            for i in range(batch_size):
+                game = pending_games[i]
+                current_player = pending_players[i]
+                action_int = actions[i].item()
+
+                # Store single state tensors for buffer
+                single_state = {k: v[i] for k, v in state_batch.items()}
+                single_legal_mask = legal_mask_tensor[i]
+
+                # Execute action
                 _, rewards, done = game.step(ActionType(action_int))
 
                 # Get reward for current player
@@ -124,21 +159,34 @@ class SelfPlayCollector:
 
                 # Store experience
                 self.buffer.add(
-                    state={k: v.squeeze(0) for k, v in state_batch.items()},
-                    action=action.squeeze(0),
+                    state=single_state,
+                    action=actions[i],
                     reward=reward,
-                    value=value.squeeze(0),
-                    log_prob=log_prob.squeeze(0),
+                    value=values[i],
+                    log_prob=log_probs[i],
                     done=done,
-                    legal_mask=legal_mask_tensor,
+                    legal_mask=single_legal_mask,
                 )
+
+                steps_collected += 1
 
                 if done:
                     hands_completed += 1
 
-            # Safety check to avoid infinite loop
-            if not made_progress:
-                break
+            # Progress output
+            if show_progress:
+                current_time = time.time()
+                if current_time - last_progress_time >= 5.0:  # Every 5 seconds
+                    elapsed = current_time - start_time
+                    hps = hands_completed / elapsed if elapsed > 0 else 0
+                    sps = steps_collected / elapsed if elapsed > 0 else 0
+                    print(
+                        f"  [Collecting] Hands: {hands_completed}/{n_hands} "
+                        f"({100*hands_completed/n_hands:.1f}%) | "
+                        f"HPS: {hps:.0f} | Steps/s: {sps:.0f}",
+                        flush=True
+                    )
+                    last_progress_time = current_time
 
         # Compute returns and advantages
         # Use zero as last value since all episodes are complete
@@ -148,7 +196,7 @@ class SelfPlayCollector:
         return self.buffer
 
     def collect_steps(self, n_steps: int) -> RolloutBuffer:
-        """Collect a fixed number of decision steps.
+        """Collect a fixed number of decision steps using vectorized inference.
 
         Alternative to collect_rollout when you want a fixed number
         of transitions rather than complete hands.
@@ -169,8 +217,14 @@ class SelfPlayCollector:
                 game.reset_hand()
 
         while steps_collected < n_steps:
+            # Step 1: Collect all games needing decisions
+            pending_games = []
+            pending_states = []
+            pending_players = []
+            pending_legal_masks = []
+
             for game in self.games:
-                if steps_collected >= n_steps:
+                if steps_collected + len(pending_games) >= n_steps:
                     break
 
                 state = game.get_state()
@@ -186,41 +240,59 @@ class SelfPlayCollector:
                 if not any(legal_mask):
                     continue
 
-                # Build state
+                # Collect for batch
                 state_dict = game.get_state_for_player(current_player)
-                state_batch = self.batch_builder.build_from_dict(state_dict)
-                state_batch = {k: v.unsqueeze(0).to(self.device) for k, v in state_batch.items()}
+                pending_games.append(game)
+                pending_states.append(state_dict)
+                pending_players.append(current_player)
+                pending_legal_masks.append(legal_mask)
 
-                legal_mask_tensor = torch.tensor(legal_mask, dtype=torch.bool, device=self.device)
+            if not pending_games:
+                break
 
-                # Get action
-                with torch.no_grad():
-                    action, log_prob, value = self.network.get_action(
-                        state_batch, legal_mask_tensor.unsqueeze(0), deterministic=False
-                    )
+            # Step 2: Batch inference
+            batch_size = len(pending_games)
 
-                # Execute action
-                action_int = action.item()
+            state_batch = self.batch_builder.build_batch_from_dicts(pending_states)
+            state_batch = {k: v.to(self.device) for k, v in state_batch.items()}
+
+            legal_mask_tensor = torch.tensor(
+                pending_legal_masks, dtype=torch.bool, device=self.device
+            )
+
+            with torch.no_grad():
+                actions, log_probs, values = self.network.get_action(
+                    state_batch, legal_mask_tensor, deterministic=False
+                )
+
+            # Step 3: Execute and store
+            for i in range(batch_size):
+                if steps_collected >= n_steps:
+                    break
+
+                game = pending_games[i]
+                current_player = pending_players[i]
+                action_int = actions[i].item()
+
+                single_state = {k: v[i] for k, v in state_batch.items()}
+                single_legal_mask = legal_mask_tensor[i]
+
                 _, rewards, done = game.step(ActionType(action_int))
-
-                # Get reward for current player
                 reward = rewards.get(current_player, 0.0)
 
-                # Store experience
                 self.buffer.add(
-                    state={k: v.squeeze(0) for k, v in state_batch.items()},
-                    action=action.squeeze(0),
+                    state=single_state,
+                    action=actions[i],
                     reward=reward,
-                    value=value.squeeze(0),
-                    log_prob=log_prob.squeeze(0),
+                    value=values[i],
+                    log_prob=log_probs[i],
                     done=done,
-                    legal_mask=legal_mask_tensor,
+                    legal_mask=single_legal_mask,
                 )
 
                 steps_collected += 1
 
         # Bootstrap value for last state
-        # Get value for current state of first non-done game
         last_value = torch.zeros(1, device=self.device)
         for game in self.games:
             state = game.get_state()
@@ -250,7 +322,7 @@ class ParallelSelfPlay:
         self,
         network: PolicyValueNetwork,
         n_games: int = 16384,
-        games_per_collector: int = 256,
+        games_per_collector: int = 1024,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         device: str = "cpu",
@@ -287,17 +359,33 @@ class ParallelSelfPlay:
             if i * games_per_collector < n_games
         ]
 
-    def collect(self, n_hands_per_collector: int) -> RolloutBuffer:
+    def collect(self, n_hands_per_collector: int, show_progress: bool = True) -> RolloutBuffer:
         """Collect experiences from all collectors.
 
         Args:
             n_hands_per_collector: Hands to collect per collector.
+            show_progress: Whether to show progress output.
 
         Returns:
             Aggregated buffer with all experiences.
         """
+        start_time = time.time()
+        total_hands = n_hands_per_collector * len(self.collectors)
+
+        if show_progress:
+            print(f"  Collecting {total_hands} hands from {len(self.collectors)} collectors...")
+
         # Collect from all collectors
-        buffers = [c.collect_rollout(n_hands_per_collector) for c in self.collectors]
+        buffers = []
+        for i, collector in enumerate(self.collectors):
+            if show_progress and len(self.collectors) > 1:
+                print(f"    Collector {i+1}/{len(self.collectors)}...", end=" ", flush=True)
+
+            buf = collector.collect_rollout(n_hands_per_collector, show_progress=False)
+            buffers.append(buf)
+
+            if show_progress and len(self.collectors) > 1:
+                print(f"done ({len(buf)} transitions)")
 
         # Merge buffers
         merged = RolloutBuffer(self.gamma, self.gae_lambda, self.device)
@@ -315,6 +403,11 @@ class ParallelSelfPlay:
         if len(merged.rewards) > 0:
             last_value = torch.zeros(1, device=self.device)
             merged.compute_returns_and_advantages(last_value)
+
+        elapsed = time.time() - start_time
+        if show_progress:
+            hps = total_hands / elapsed if elapsed > 0 else 0
+            print(f"  Collection complete: {len(merged)} transitions in {elapsed:.1f}s ({hps:.0f} hands/s)")
 
         return merged
 

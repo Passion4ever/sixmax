@@ -122,7 +122,7 @@ class Trainer:
             hands_per_collector = max(
                 1, self.config.n_hands_per_update // len(self.self_play.collectors)
             )
-            buffer = self.self_play.collect(hands_per_collector)
+            buffer = self.self_play.collect(hands_per_collector, show_progress=True)
             hands_collected = len(buffer)
             self.total_hands += hands_collected
 
